@@ -2,10 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
-from google.ads.googleads.client import GoogleAdsClient
-from google.ads.googleads.errors import GoogleAdsException
-import os
-import json
+import requests
+import time
 
 # Function to calculate remaining days in the current month
 def calculate_remaining_days(selected_end_date):
@@ -35,14 +33,6 @@ class MetaAPI:
         }
         return self._make_request(url, params=params)
 
-    def fetch_adsets_with_budgets(self, campaign_id):
-        url = f"https://graph.facebook.com/v15.0/{campaign_id}/adsets"
-        params = {
-            "fields": "id,name,daily_budget",
-            "effective_status": '["ACTIVE"]',
-        }
-        return self._make_request(url, params=params)
-
     def fetch_spend(self, entity_id, start_date, end_date):
         url = f"https://graph.facebook.com/v15.0/{entity_id}/insights"
         params = {
@@ -61,93 +51,39 @@ class MetaAPI:
         }
         return self._make_request(url, method="POST", data=data)
 
-# Google Ads API Wrapper Class
-class GoogleAdsAPI:
-    def __init__(self, credentials_path):
-        # Load client from JSON credentials file
-        self.client = GoogleAdsClient.load_from_storage(credentials_path)
-
-    def fetch_campaigns_with_budgets(self, customer_id):
-        service = self.client.get_service("GoogleAdsService")
-        query = """
-            SELECT
-              campaign.id,
-              campaign.name,
-              campaign_budget.amount_micros
-            FROM
-              campaign
-            WHERE
-              campaign.status = 'ENABLED'
-        """
-        response = service.search_stream(customer_id=customer_id, query=query)
-        data = []
-        for batch in response:
-            for row in batch.results:
-                campaign = row.campaign
-                campaign_budget = row.campaign_budget
-                data.append({
-                    "id": campaign.id,
-                    "name": campaign.name,
-                    "daily_budget": campaign_budget.amount_micros / 1_000_000  # Convert micros to standard units
-                })
-        return data
-
-    def fetch_spend(self, customer_id, start_date, end_date):
-        service = self.client.get_service("GoogleAdsService")
-        query = f"""
-            SELECT
-              campaign.id,
-              metrics.cost_micros
-            FROM
-              campaign
-            WHERE
-              metrics.date >= '{start_date}' AND metrics.date <= '{end_date}'
-        """
-        response = service.search_stream(customer_id=customer_id, query=query)
-        spend_data = {}
-        for batch in response:
-            for row in batch.results:
-                campaign_id = row.campaign.id
-                cost = row.metrics.cost_micros / 1_000_000  # Convert micros to standard units
-                spend_data[campaign_id] = cost
-        return spend_data
-
-    def update_budget(self, customer_id, campaign_id, new_budget):
-        campaign_service = self.client.get_service("CampaignBudgetService")
-        budget_operation = self.client.get_type("CampaignBudgetOperation")
-        budget_operation.update.resource_name = campaign_service.campaign_budget_path(customer_id, campaign_id)
-        budget_operation.update.amount_micros = int(new_budget * 1_000_000)  # Convert to micros
-        try:
-            campaign_service.mutate_campaign_budget(customer_id=customer_id, operations=[budget_operation])
-            return {"success": True}
-        except GoogleAdsException as ex:
-            return {"error": str(ex)}
-
 # Streamlit UI
-st.title("Campaign Budget Management for Meta Ads and Google Ads")
-
-# Platform selection
-selected_platforms = st.multiselect(
-    "Select Platform(s) to Adjust Budgets For",
-    options=["Meta Ads", "Google Ads"],
-)
+st.title("Campaign Budget Management for Meta Ads")
 
 # Meta Ads Functionality
-if "Meta Ads" in selected_platforms:
-    st.subheader("Meta Ads Budget Management")
-    access_token = st.text_input("Meta Ads Access Token", type="password")
-    ad_account_id = st.text_input("Meta Ad Account ID")
-    total_monthly_budget = st.number_input("Total Monthly Budget Allocated ($)", min_value=0.0, step=1.0)
+st.subheader("Meta Ads Budget Management")
+access_token = st.text_input("Meta Ads Access Token", type="password")
+ad_account_id = st.text_input("Meta Ad Account ID")
+total_monthly_budget = st.number_input("Total Monthly Budget Allocated ($)", min_value=0.0, step=1.0)
 
-    date_range = st.date_input("Date Range", [datetime.now().replace(day=1), datetime.now()])
-    if len(date_range) == 2:
-        start_date = date_range[0].strftime("%Y-%m-%d")
-        end_date = date_range[1].strftime("%Y-%m-%d")
-        remaining_days = calculate_remaining_days(date_range[1])
+padding_option = st.selectbox(
+    "Select Padding Percentage",
+    ["1%", "2%", "3%", "4%", "5%", "Custom"],
+    index=4
+)
+if padding_option == "Custom":
+    custom_padding = st.number_input(
+        "Enter Custom Padding (%)", min_value=0.0, max_value=100.0, step=1.0
+    )
+    padding_percent = 1 - (custom_padding / 100)
+else:
+    padding_percent = 1 - (int(padding_option.strip("%")) / 100)
 
-    if access_token:
-        meta_api = MetaAPI(access_token)
-        if st.button("Fetch Meta Ads Data"):
+date_range = st.date_input("Date Range", [datetime.now().replace(day=1), datetime.now()])
+if len(date_range) == 2:
+    start_date = date_range[0].strftime("%Y-%m-%d")
+    end_date = date_range[1].strftime("%Y-%m-%d")
+    remaining_days = calculate_remaining_days(date_range[1])
+
+if access_token:
+    meta_api = MetaAPI(access_token)
+
+    if st.button("Fetch Meta Ads Data"):
+        with st.spinner("Fetching data..."):
             campaigns_response = meta_api.fetch_campaigns_with_budgets(ad_account_id)
             if "error" in campaigns_response:
                 st.error(f"Error fetching campaigns: {campaigns_response['error']}")
@@ -168,64 +104,16 @@ if "Meta Ads" in selected_platforms:
                             "New Daily Budget ($)": 0.0,
                         })
                 st.session_state["campaign_data"] = pd.DataFrame(all_data)
-                st.success("Meta Ads data fetched successfully!")
+                st.session_state["total_spend"] = sum(row["Spend ($)"] for row in all_data)
+                st.session_state["remaining_budget"] = (total_monthly_budget - st.session_state["total_spend"]) * padding_percent
+                st.session_state["remaining_days"] = remaining_days
+                st.session_state["show_commit_buttons"] = False
 
-# Google Ads Functionality
-if "Google Ads" in selected_platforms:
-    st.subheader("Google Ads Budget Management")
-    customer_id = st.text_input("Google Ads Customer ID")
-    total_monthly_budget = st.number_input("Google Ads Total Monthly Budget ($)", min_value=0.0, step=1.0)
-
-    # Fetch JSON credentials from GitHub Secrets
-    credentials_json = os.getenv("GOOGLE_ADS_CREDENTIALS")
-    credentials_path = "/tmp/google_ads_credentials.json"
-
-    if credentials_json:
-        try:
-            # Parse escaped JSON string and write it to a file
-            credentials_data = json.loads(credentials_json)
-            with open(credentials_path, "w") as f:
-                json.dump(credentials_data, f)
-            st.success("Credentials loaded successfully!")
-        except Exception as e:
-            st.error(f"Error loading credentials: {e}")
-    else:
-        st.error("Google Ads credentials not found in environment variables.")
-
-    # Proceed if credentials are valid
-    if os.path.exists(credentials_path):
-        google_ads_api = GoogleAdsAPI(credentials_path)
-
-        date_range = st.date_input("Date Range", [datetime.now().replace(day=1), datetime.now()])
-        if len(date_range) == 2:
-            start_date = date_range[0].strftime("%Y-%m-%d")
-            end_date = date_range[1].strftime("%Y-%m-%d")
-            remaining_days = calculate_remaining_days(date_range[1])
-
-        if st.button("Fetch Google Ads Data"):
-            campaigns = google_ads_api.fetch_campaigns_with_budgets(customer_id)
-            spend_data = google_ads_api.fetch_spend(customer_id, start_date, end_date)
-
-            all_data = []
-            for campaign in campaigns:
-                campaign_id = campaign["id"]
-                spend = spend_data.get(campaign_id, 0)
-                all_data.append({
-                    "Name": campaign["name"],
-                    "Entity ID": campaign_id,
-                    "Daily Budget ($)": campaign["daily_budget"],
-                    "Spend ($)": spend,
-                    "Daily Spend %": 0.0,
-                    "New Daily %": 0.0,
-                    "New Daily Budget ($)": 0.0,
-                })
-
-            st.session_state["campaign_data"] = pd.DataFrame(all_data)
-            st.success("Google Ads data fetched successfully!")
-
-# Shared Logic for Campaign Data Management
 if "campaign_data" in st.session_state:
     campaign_data = st.session_state["campaign_data"]
+    total_spend = st.session_state["total_spend"]
+    remaining_budget = st.session_state["remaining_budget"]
+    remaining_days = st.session_state["remaining_days"]
 
     st.write("### Current Campaign Spend Data")
     gb = GridOptionsBuilder.from_dataframe(campaign_data)
@@ -249,10 +137,49 @@ if "campaign_data" in st.session_state:
 
     if st.button("Calculate New Daily Budgets"):
         campaign_data["New Daily Budget ($)"] = campaign_data["New Daily %"].apply(
-            lambda x: round((x / 100 * total_monthly_budget) / remaining_days, 2)
+            lambda x: round((x / 100 * remaining_budget) / remaining_days, 2)
         )
-        st.write("### Updated Campaign Data")
-        st.write(campaign_data)
+        st.session_state["campaign_data"] = campaign_data
+        st.session_state["show_commit_buttons"] = True
 
-    if st.button("Commit All Budgets"):
-        st.write("Committing all changes...")
+    if st.session_state.get("show_commit_buttons", False):
+        st.write("### Updated Campaigns Spend Data")
+        for i, row in campaign_data.iterrows():
+            st.write(f"Campaign: {row['Name']}")
+            st.write(f"New Daily Budget: ${row['New Daily Budget ($)']:.2f}")
+
+            if f"commit_{i}" not in st.session_state:
+                st.session_state[f"commit_{i}"] = False
+
+            if not st.session_state[f"commit_{i}"]:
+                if st.button(f"Prepare to Commit {row['Name']}", key=f"prepare_{i}"):
+                    st.session_state[f"commit_{i}"] = True
+
+            if st.session_state[f"commit_{i}"]:
+                if st.button(f"Commit {row['Name']}", key=f"button_commit_{i}"):
+                    result = meta_api.update_budget(row["Entity ID"], row["New Daily Budget ($)"])
+                    if "error" in result:
+                        st.error(f"Failed to update {row['Name']}: {result['error']['message']}")
+                    else:
+                        st.success(f"Successfully updated {row['Name']}!")
+
+        if "commit_all_ready" not in st.session_state:
+            st.session_state["commit_all_ready"] = False
+
+        if not st.session_state["commit_all_ready"]:
+            if st.button("Prepare to Commit All Budgets"):
+                st.session_state["commit_all_ready"] = True
+
+        if st.session_state["commit_all_ready"]:
+            if st.button("Commit All Budgets"):
+                for _, row in campaign_data.iterrows():
+                    result = meta_api.update_budget(row["Entity ID"], row["New Daily Budget ($)"])
+                    if "error" in result:
+                        st.error(f"Failed to update {row['Name']}: {result['error']['message']}")
+                    else:
+                        st.success(f"Successfully updated all budgets!")
+
+    st.write("### Summary")
+    st.write(f"**Total Spend for Selected Period:** ${total_spend:.2f}")
+    st.write(f"**Total Budget Remaining ({int(padding_percent * 100)}%):** ${remaining_budget:.2f}")
+    st.write(f"**Total Days Remaining in Month:** {remaining_days} days")
