@@ -207,6 +207,8 @@ if "Meta Ads" in selected_platforms:
         total_budget_remaining = st.session_state["total_budget_remaining"]
         remaining_days = st.session_state["remaining_days"]
 
+        # Configure AgGrid for Current Campaign Spend Table
+        st.write("### Current Campaign Spend Data")
         gb = GridOptionsBuilder.from_dataframe(campaign_data)
         gb.configure_column("New Daily %", editable=True, cellStyle=JsCode("""
             function(params) {
@@ -216,33 +218,9 @@ if "Meta Ads" in selected_platforms:
                 return {};
             }
         """))
-        if st.session_state.get("show_commit_buttons", False):
-            gb.configure_column("Commit", cellRenderer=JsCode("""
-                class CommitRenderer {
-                    init(params) {
-                        this.params = params;
-                        this.eGui = document.createElement('button');
-                        this.eGui.className = 'commit-button';
-                        this.eGui.innerText = 'Commit';
-                        this.eGui.addEventListener('click', this.onClick.bind(this));
-                    }
-                    onClick() {
-                        const entityId = this.params.data['Entity ID'];
-                        const newBudget = this.params.data['New Daily Budget ($)'];
-                        const confirmation = confirm(`Update the current budget to $${newBudget.toFixed(2)}?`);
-                        if (confirmation) {
-                            fetch(`/commit-budget/${entityId}/${newBudget}`, { method: 'POST' })
-                                .then(response => response.json())
-                                .then(() => alert('Budget updated successfully!'))
-                                .catch(() => alert('Failed to update budget.'));
-                        }
-                    }
-                    getGui() { return this.eGui; }
-                }
-            """))
-
         grid_options = gb.build()
-        grid_response = AgGrid(
+
+        AgGrid(
             campaign_data,
             gridOptions=grid_options,
             update_mode=GridUpdateMode.VALUE_CHANGED,
@@ -251,33 +229,35 @@ if "Meta Ads" in selected_platforms:
         )
 
         if st.button("Calculate New Daily Budgets"):
-            updated_df = pd.DataFrame(grid_response["data"])
-            new_daily_percent_sum = updated_df["New Daily %"].sum()
-            if new_daily_percent_sum > 100:
-                st.error(f"The daily % is greater than 100% (current daily % set at {new_daily_percent_sum:.2f}%). Please recalculate.")
-            else:
-                updated_df["New Daily Budget ($)"] = updated_df["New Daily %"].apply(
-                    lambda x: round((x / 100 * total_budget_remaining) / remaining_days, 2)
-                )
-                st.session_state["campaign_data"] = updated_df
-                st.session_state["show_commit_buttons"] = True
-                st.write("### Updated Campaigns Spend Data")
-                st.dataframe(updated_df)
+            campaign_data["New Daily Budget ($)"] = campaign_data["New Daily %"].apply(
+                lambda x: round((x / 100 * total_budget_remaining) / remaining_days, 2)
+            )
+            st.session_state["campaign_data"] = campaign_data
+            st.session_state["show_commit_buttons"] = True
 
-        # Add "Commit All Budgets" Button
+        # Updated Campaigns Spend Table
         if st.session_state.get("show_commit_buttons", False):
-            if st.button("Commit All Budgets"):
-                confirmation = st.text_input(
-                    "Type 'Yes' to confirm all budget updates:"
-                )
-                if confirmation.lower() == "yes":
-                    for _, row in campaign_data.iterrows():
-                        response = update_budget(access_token, row["Entity ID"], row["New Daily Budget ($)"])
-                        if "error" in response:
-                            st.error(f"Failed for {row['Name']}: {response['error']['message']}")
-                        else:
-                            st.success(f"Updated for {row['Name']}!")
+            st.write("### Updated Campaigns Spend Data")
+            for i, row in campaign_data.iterrows():
+                st.write(f"Campaign: {row['Name']}")
+                st.write(f"New Daily Budget: ${row['New Daily Budget ($)']:.2f}")
 
+                if st.button(f"Commit {row['Name']}", key=f"commit_{i}"):
+                    result = update_budget(access_token, row["Entity ID"], row["New Daily Budget ($)"])
+                    if "error" in result:
+                        st.error(f"Failed to update {row['Name']}: {result['error']['message']}")
+                    else:
+                        st.success(f"Successfully updated {row['Name']}!")
+
+            if st.button("Commit All Budgets"):
+                for _, row in campaign_data.iterrows():
+                    result = update_budget(access_token, row["Entity ID"], row["New Daily Budget ($)"])
+                    if "error" in result:
+                        st.error(f"Failed to update {row['Name']}: {result['error']['message']}")
+                    else:
+                        st.success(f"Successfully updated {row['Name']}!")
+
+        # Summary Section
         st.write("### Summary")
         st.write(f"**Total Spend for Selected Period:** ${total_spend:.2f}")
         st.write(f"**Total Budget Remaining ({int(padding_percent * 100)}%):** ${total_budget_remaining:.2f}")
